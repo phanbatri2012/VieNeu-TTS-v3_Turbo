@@ -141,6 +141,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         backend: str = "auto",   # "auto" → ONNX on CPU, PyTorch on GPU; "onnx"|"pytorch" to force
         onnx_repo: Optional[str] = None,
         onnx_dir: Optional[str] = None,
+        codec_dir: Optional[str] = None,
         precision: str = "fp32",   # ONNX/CPU backbone: "fp32" (mặc định, chất-lượng-tối-đa) | "int8" (nhanh ~3x/frame, nhỏ 4x; cần CPU hỗ trợ VNNI để không bị méo)
         onnx_subfolder: Optional[str] = None,   # override thủ công subfolder; None → suy từ `precision`
         threads: int = 0,   # ONNX/CPU intra-op threads; 0 = mặc định engine (~nhân vật lý, cap 8). Đặt số cụ thể để tinh chỉnh.
@@ -177,6 +178,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 checkpoint_path=backbone_repo,
                 onnx_repo=onnx_repo,
                 onnx_dir=onnx_dir,
+                codec_dir=codec_dir,
                 onnx_subfolder=onnx_subfolder,
                 threads=threads,
             )
