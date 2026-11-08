@@ -3,6 +3,7 @@ stream slots, health, auth and the listening address. ``Engine.__init__`` runs
 for real."""
 import gc
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,12 +36,26 @@ class FakeTTS:
         self.enrolled.append(name)
         self._preset_voices[name] = {}
 
+    def remove_voice(self, name, save=False):
+        self._preset_voices.pop(name, None)
+
 
 @pytest.fixture
-def eng(monkeypatch):
+def eng(monkeypatch, tmp_path):
     for var in ("VIENEU_API_KEY", "VIENEU_MAX_STREAMS", "VIENEU_QUEUE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(api, "Vieneu", lambda **kw: FakeTTS())
+    monkeypatch.setenv("VIENEU_HOME", str(tmp_path))
+    def fake_normalize(_source, destination, **_kwargs):
+        Path(destination).write_bytes(b"RIFF")
+        return {
+            "sample_rate": 48000,
+            "channels": 1,
+            "duration_seconds": 4.0,
+            "clip_start_seconds": 0.0,
+            "clip_end_seconds": 4.0,
+        }
+    monkeypatch.setattr(api, "_normalize_reference_audio", fake_normalize)
     e = api.Engine()
     monkeypatch.setattr(api, "ENGINE", e)
     return e
@@ -114,6 +129,69 @@ def test_new_voice_is_enrolled(client, eng):
                     files={"file": ("me.wav", b"RIFF", "audio/wav")})
     assert r.status_code == 200
     assert eng.tts.enrolled == ["Giọng của tôi"]
+    assert r.json()["source"] == "user"
+    assert r.json()["revision"] == 1
+
+    listed = client.get("/v1/voices").json()["data"]
+    saved = next(item for item in listed if item["id"] == "Giọng của tôi")
+    assert saved["source"] == "user"
+    assert saved["synthesis"]["top_k"] == 25
+    assert saved["profile"]["reference"]["available"] is True
+
+    revisions = client.get("/v1/voices/Gi%E1%BB%8Dng%20c%E1%BB%A7a%20t%C3%B4i/revisions")
+    assert revisions.status_code == 200
+    assert [item["revision"] for item in revisions.json()["data"]] == [1]
+    reference = client.get("/v1/voices/Gi%E1%BB%8Dng%20c%E1%BB%A7a%20t%C3%B4i/reference?revision=1")
+    assert reference.status_code == 200 and reference.content == b"RIFF"
+
+
+def test_voice_defaults_are_owned_by_vieneu(client, eng):
+    eng.tts._preset_voices["BH_1"] = {
+        api.user_voices.USER_MARK: True,
+        "revision": 3,
+        "synthesis": {"temperature": 0.61, "top_k": 17},
+    }
+    r = _speech(client, voice="BH_1")
+    assert r.status_code == 200
+    call = eng.tts.stream_calls[-1]
+    assert call["temperature"] == 0.61
+    assert call["top_k"] == 17
+    assert call["top_p"] == 0.95
+
+
+def test_poetry_delivery_is_owned_by_selected_voice(eng):
+    eng.tts._preset_voices["BH_1"] = {
+        api.user_voices.USER_MARK: True,
+        "revision": 4,
+        "delivery": {
+            "mode": "poetry_recitation",
+            "candidates_per_line": 2,
+            "line_pause_ms": 900,
+            "sentence_pause_ms": 1200,
+            "stanza_pause_ms": 2200,
+            "target_rms_db": -15,
+            "reverb_wet": 0.08,
+        },
+    }
+    delivery = api._delivery_settings(eng, api.SpeechRequest(input="Dòng một", voice="BH_1"))
+    assert delivery["mode"] == "poetry_recitation"
+    assert delivery["candidates_per_line"] == 2
+    assert delivery["stanza_pause_ms"] == 2200
+    assert api._poetry_lines("Dòng một\nDòng hai\n\nDòng ba") == [
+        ("Dòng một", False),
+        ("Dòng hai", True),
+        ("Dòng ba", False),
+    ]
+
+
+def test_delete_only_removes_user_voice(client, eng):
+    eng.tts._preset_voices["BH_1"] = {
+        api.user_voices.USER_MARK: True,
+        "revision": 1,
+    }
+    assert client.delete("/v1/voices/BH_1").status_code == 200
+    assert "BH_1" not in eng.tts._preset_voices
+    assert client.delete("/v1/voices/Mai%20Anh").status_code == 400
 
 
 def test_dead_scheduler_fails_health_and_new_requests(client, eng):

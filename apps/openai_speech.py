@@ -59,6 +59,7 @@ import hmac
 import io
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -71,12 +72,16 @@ from typing import Any, Iterator, Optional
 
 import numpy as np
 import uvicorn
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
+try:
+    from apps import user_voices
+except ModuleNotFoundError:  # direct: python apps/openai_speech.py
+    import user_voices
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -103,7 +108,9 @@ class Engine:
         device = os.environ.get("VIENEU_DEVICE", "auto")
         kw: dict = dict(backend=backend, device=device,
                         precision=os.environ.get("VIENEU_PRECISION", "fp32"),
+                        backbone_repo=os.environ.get("VIENEU_BACKBONE_DIR", "pnnbao-ump/VieNeu-TTS-v3-Turbo"),
                         onnx_dir=os.environ.get("VIENEU_ONNX_DIR") or None,
+                        codec_dir=os.environ.get("VIENEU_CODEC_DIR") or None,
                         max_streams=_env_int("VIENEU_MAX_STREAMS", 16))
         log.info("⏳ loading VieNeu-TTS v3 Turbo (backend=%s device=%s)", backend, device)
         t = time.perf_counter()
@@ -112,6 +119,7 @@ class Engine:
         # The voices and aliases that exist before any client enrolls one;
         # POST /v1/voices may not replace them.
         self.builtin_voices = frozenset(self.tts._preset_voices) | frozenset(self.tts._voice_aliases)
+        loaded_user_voices = user_voices.load_user_voices(self.tts)
         self.watermark = os.environ.get("VIENEU_WATERMARK", "1") != "0"
         # GPU: the scheduler batches every stream. CPU: the ONNX engine interleaves
         # calls frame by frame, but they share the cores — measured on a 6-core
@@ -127,6 +135,7 @@ class Engine:
         self.queue_timeout = float(os.environ.get("VIENEU_QUEUE_TIMEOUT", "10"))
         self._gate = threading.BoundedSemaphore(self.max_streams)
         self._lock = threading.Lock()
+        self._seed_lock = threading.Lock()
         self.active = 0
         self.waiting = 0
         # Warm-up: capture the CUDA graphs / load the ONNX graphs before the
@@ -135,6 +144,8 @@ class Engine:
             pass
         log.info("✅ ready in %.1fs: backend=%s max_streams=%d queue=%d", time.perf_counter() - t,
                  self.backend, self.max_streams, self.max_queue)
+        if loaded_user_voices:
+            log.info("Loaded %d persisted user voice(s)", len(loaded_user_voices))
 
     def acquire(self) -> None:
         with self._lock:
@@ -164,9 +175,25 @@ class Engine:
     def voices(self) -> list:
         out = []
         for name, v in self.tts._preset_voices.items():
-            out.append({"id": name, "name": name, "description": v.get("description", ""),
-                        "gender": v.get("gender", ""), "featured": v.get("featured"),
-                        "aliases": list(v.get("aliases") or [])})
+            is_user = bool(v.get(user_voices.USER_MARK))
+            revision = max(1, int(v.get("revision") or 1))
+            item = {"id": name, "name": name, "description": v.get("description", ""),
+                    "gender": v.get("gender", ""), "featured": v.get("featured"),
+                    "aliases": list(v.get("aliases") or []),
+                    "source": "user" if is_user else "builtin",
+                    "revision": revision,
+                    "synthesis": user_voices.normalize_synthesis(v.get("synthesis")),
+                    "delivery": user_voices.normalize_delivery(v.get("delivery"))}
+            if is_user:
+                try:
+                    item["profile"] = user_voices.profile_summary(name, revision)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    item["profile"] = {
+                        "voice_id": name,
+                        "revision": revision,
+                        "reference": {"available": False},
+                    }
+            out.append(item)
         return out
 
 
@@ -283,11 +310,153 @@ class SpeechRequest(BaseModel):
     sample_rate: int = SAMPLE_RATE
     # Bounded so one request cannot break the GPU scheduler every stream shares:
     # e.g. a huge top_k overflowed its int64 slot and NaN reached multinomial.
-    temperature: float = Field(0.8, ge=0.0, le=2.0, allow_inf_nan=False)
-    top_k: int = Field(25, ge=1, le=1024)   # 1024 = the codec's vocabulary
-    top_p: float = Field(0.95, gt=0.0, le=1.0, allow_inf_nan=False)
-    repetition_penalty: float = Field(1.2, ge=1.0, le=2.0, allow_inf_nan=False)
-    max_chars: int = Field(256, ge=64, le=512)
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_k: Optional[int] = Field(None, ge=1, le=1024)   # 1024 = the codec's vocabulary
+    top_p: Optional[float] = Field(None, gt=0.0, le=1.0, allow_inf_nan=False)
+    repetition_penalty: Optional[float] = Field(None, ge=1.0, le=2.0, allow_inf_nan=False)
+    max_chars: Optional[int] = Field(None, ge=64, le=512)
+    gain_db: Optional[float] = Field(None, ge=-12.0, le=12.0, allow_inf_nan=False)
+    seed: Optional[int] = Field(None, ge=0, le=0xFFFFFFFF)
+
+
+def _synthesis_settings(eng: Engine, req: SpeechRequest) -> dict:
+    voice_name = eng.tts.resolve_voice_name(req.voice) if req.voice else None
+    voice = eng.tts._preset_voices.get(voice_name) if voice_name else None
+    settings = user_voices.normalize_synthesis((voice or {}).get("synthesis"))
+    for key in settings:
+        override = getattr(req, key)
+        if override is not None:
+            settings[key] = override
+    return settings
+
+
+def _delivery_settings(eng: Engine, req: SpeechRequest) -> dict:
+    voice_name = eng.tts.resolve_voice_name(req.voice) if req.voice else None
+    voice = eng.tts._preset_voices.get(voice_name) if voice_name else None
+    return user_voices.normalize_delivery((voice or {}).get("delivery"))
+
+
+def _poetry_lines(text: str) -> list[tuple[str, bool]]:
+    lines: list[tuple[str, bool]] = []
+    pending_stanza_break = False
+    for raw in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        cleaned = raw.strip()
+        if not cleaned:
+            if lines:
+                pending_stanza_break = True
+            continue
+        if pending_stanza_break and lines:
+            previous, _ = lines[-1]
+            lines[-1] = (previous, True)
+            pending_stanza_break = False
+        lines.append((cleaned, False))
+    return lines
+
+
+def _candidate_score(audio: np.ndarray) -> float:
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if len(samples) < SAMPLE_RATE // 5 or not np.all(np.isfinite(samples)):
+        return -1e9
+    absolute = np.abs(samples)
+    clipping = float(np.mean(absolute >= 0.995))
+    if clipping > 0.002:
+        return -1e9
+    frame = max(1, SAMPLE_RATE // 50)
+    usable = len(samples) - (len(samples) % frame)
+    if usable <= 0:
+        return -1e9
+    envelope = np.sqrt(
+        np.mean(np.square(samples[:usable].reshape(-1, frame)), axis=1) + 1e-12
+    )
+    voiced = envelope[envelope > 0.003]
+    if len(voiced) < 3:
+        return -1e9
+    dynamics = float(np.std(20.0 * np.log10(voiced + 1e-8)))
+    tail_size = min(len(samples), int(SAMPLE_RATE * 0.35))
+    tail_rms = float(np.sqrt(np.mean(np.square(samples[-tail_size:])) + 1e-12))
+    body_rms = float(np.sqrt(np.mean(np.square(samples)) + 1e-12))
+    tail_ratio = min(1.5, tail_rms / max(body_rms, 1e-6))
+    return dynamics * 0.7 + tail_ratio * 0.3 - clipping * 100.0
+
+
+def _fade_tail(audio: np.ndarray, milliseconds: int) -> np.ndarray:
+    samples = np.asarray(audio, dtype=np.float32).copy()
+    count = min(len(samples), max(0, int(SAMPLE_RATE * milliseconds / 1000)))
+    if count:
+        samples[-count:] *= np.linspace(1.0, 0.0, count, dtype=np.float32)
+    return samples
+
+
+def _apply_poetry_master(audio: np.ndarray, delivery: dict) -> np.ndarray:
+    dry = np.asarray(audio, dtype=np.float32).reshape(-1)
+    wet_ratio = float(delivery["reverb_wet"])
+    mixed = dry.copy()
+    if wet_ratio > 0.0 and len(dry):
+        wet = np.zeros_like(dry)
+        pre_delay = int(SAMPLE_RATE * int(delivery["reverb_pre_delay_ms"]) / 1000)
+        decay = float(delivery["reverb_decay_seconds"])
+        for tap in range(1, 7):
+            seconds = pre_delay / SAMPLE_RATE + decay * tap / 7.0
+            delay = int(seconds * SAMPLE_RATE)
+            if delay >= len(dry):
+                break
+            gain = math.exp(-3.0 * seconds / max(decay, 0.1))
+            wet[delay:] += dry[:-delay] * gain
+        wet_peak = float(np.max(np.abs(wet))) if len(wet) else 0.0
+        if wet_peak > 1.0:
+            wet /= wet_peak
+        mixed = dry * (1.0 - wet_ratio) + wet * wet_ratio
+    rms = float(np.sqrt(np.mean(np.square(mixed)) + 1e-12))
+    target = 10.0 ** (float(delivery["target_rms_db"]) / 20.0)
+    if rms > 0.0:
+        mixed *= target / rms
+    peak = float(np.max(np.abs(mixed))) if len(mixed) else 0.0
+    peak_limit = 10.0 ** (float(delivery["peak_db"]) / 20.0)
+    if peak > peak_limit:
+        mixed *= peak_limit / peak
+    return np.asarray(mixed, dtype=np.float32)
+
+
+def _render_poetry(eng: Engine, req: SpeechRequest, settings: dict, delivery: dict) -> np.ndarray:
+    lines = _poetry_lines(req.input)
+    if not lines:
+        raise HTTPException(400, "poetry input has no non-empty line")
+    base_seed = int(req.seed or 0) & 0xFFFFFFFF
+    output: list[np.ndarray] = []
+    for line_index, (source_text, stanza_break) in enumerate(lines):
+        synthesis_text = source_text
+        if synthesis_text[-1:] not in ".,!?;:…":
+            synthesis_text += "." if stanza_break or line_index == len(lines) - 1 else ","
+        candidates: list[np.ndarray] = []
+        for variant in range(int(delivery["candidates_per_line"])):
+            seed = (base_seed + line_index * 1009 + variant * 9176) & 0xFFFFFFFF
+            np.random.seed(seed)
+            chunks = [
+                np.asarray(chunk, dtype=np.float32).reshape(-1)
+                for chunk in eng.tts.infer_stream(
+                    synthesis_text,
+                    voice=req.voice or None,
+                    apply_watermark=eng.watermark,
+                    **settings,
+                )
+                if chunk is not None and len(chunk)
+            ]
+            candidate = np.concatenate(chunks) if chunks else np.zeros(0, np.float32)
+            candidates.append(candidate)
+        winner = max(candidates, key=_candidate_score)
+        if _candidate_score(winner) <= -1e8:
+            raise HTTPException(422, f"no valid audio candidate for poetry line {line_index + 1}")
+        output.append(_fade_tail(winner, int(delivery["tail_fade_ms"])))
+        if line_index < len(lines) - 1:
+            if stanza_break:
+                pause_ms = int(delivery["stanza_pause_ms"])
+            elif source_text[-1:] in ".!?":
+                pause_ms = int(delivery["sentence_pause_ms"])
+            else:
+                pause_ms = int(delivery["line_pause_ms"])
+            if pause_ms:
+                output.append(np.zeros(int(SAMPLE_RATE * pause_ms / 1000), dtype=np.float32))
+    return _apply_poetry_master(np.concatenate(output), delivery)
 
 
 def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot) -> Iterator[np.ndarray]:
@@ -296,14 +465,40 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot) -> It
     first = None
     emitted = 0
     rs = _Resampler(req.sample_rate)
+    settings = _synthesis_settings(eng, req)
+    delivery = _delivery_settings(eng, req)
+    gain = 10.0 ** (float(settings.pop("gain_db", 0.0)) / 20.0)
     try:
-        for chunk in eng.tts.infer_stream(
-            req.input, voice=req.voice or None, apply_watermark=eng.watermark,
-            temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
-            repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
-        ):
+        def generated_chunks() -> Iterator[np.ndarray]:
+            if delivery["mode"] == "poetry_recitation":
+                with eng._seed_lock:
+                    yield _render_poetry(eng, req, settings, delivery)
+                return
+            if req.seed is None:
+                yield from eng.tts.infer_stream(
+                    req.input, voice=req.voice or None,
+                    apply_watermark=eng.watermark, **settings,
+                )
+                return
+            # VieNeu's ONNX sampler uses NumPy's process-global RNG. Seeded
+            # requests are serialized so concurrent streams cannot corrupt
+            # deterministic retries.
+            with eng._seed_lock:
+                np.random.seed(req.seed)
+                yield from eng.tts.infer_stream(
+                    req.input, voice=req.voice or None,
+                    apply_watermark=eng.watermark, **settings,
+                )
+
+        for chunk in generated_chunks():
             if chunk is None or len(chunk) == 0:
                 continue
+            if gain != 1.0:
+                chunk = np.clip(
+                    np.asarray(chunk, dtype=np.float32) * gain,
+                    -1.0,
+                    1.0,
+                )
             if first is None:
                 first = time.perf_counter() - t0
             emitted += len(chunk)
@@ -401,10 +596,70 @@ _CLIP_EXTS = {".wav": ".wav", ".mp3": ".mp3", ".flac": ".flac", ".ogg": ".ogg", 
 _MAX_CLIP_BYTES = 20 * 1024 * 1024
 
 
+def _normalize_reference_audio(
+    source_path: str,
+    destination_path: str,
+    *,
+    start_seconds: float,
+    end_seconds: Optional[float],
+) -> dict:
+    # Lazy imports keep API contract tests independent of the production
+    # runtime's native audio stack.
+    import soundfile as sf
+    from scipy.signal import resample_poly
+
+    audio, sample_rate = sf.read(source_path, dtype="float32", always_2d=True)
+    if sample_rate <= 0 or audio.size == 0:
+        raise ValueError("reference audio is empty or cannot be decoded")
+    total_duration = len(audio) / float(sample_rate)
+    start = max(0.0, float(start_seconds or 0.0))
+    end = total_duration if end_seconds is None else min(float(end_seconds), total_duration)
+    if end <= start:
+        raise ValueError("reference clip end must be greater than start")
+    start_frame = min(len(audio), int(round(start * sample_rate)))
+    end_frame = min(len(audio), int(round(end * sample_rate)))
+    clip = np.mean(audio[start_frame:end_frame], axis=1, dtype=np.float32)
+    duration = len(clip) / float(sample_rate)
+    if duration < 3.0 or duration > 8.0:
+        raise ValueError("reference clip must be between 3 and 8 seconds")
+    if not np.isfinite(clip).all():
+        raise ValueError("reference clip contains invalid samples")
+    if sample_rate != SAMPLE_RATE:
+        divisor = math.gcd(int(sample_rate), SAMPLE_RATE)
+        clip = resample_poly(
+            clip,
+            SAMPLE_RATE // divisor,
+            int(sample_rate) // divisor,
+        ).astype(np.float32, copy=False)
+    if float(np.max(np.abs(clip), initial=0.0)) >= 1.0:
+        raise ValueError("reference clip is clipping")
+    sf.write(destination_path, clip, SAMPLE_RATE, subtype="PCM_16")
+    return {
+        "sample_rate": SAMPLE_RATE,
+        "channels": 1,
+        "duration_seconds": round(len(clip) / float(SAMPLE_RATE), 6),
+        "clip_start_seconds": round(start, 6),
+        "clip_end_seconds": round(end, 6),
+    }
+
+
 @app.post("/v1/voices", dependencies=[Depends(_auth)])
-def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool = Form(True),
-              description: str = Form("")):
-    """Enroll a 3-8 s reference clip as ``voice=name`` (in memory, for this process).
+def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool = Form(False),
+              description: str = Form(""), temperature: float = Form(0.8),
+              top_k: int = Form(25), top_p: float = Form(0.95),
+              repetition_penalty: float = Form(1.2), max_chars: int = Form(256),
+              gain_db: float = Form(0.0),
+              delivery_mode: str = Form("standard"),
+              candidates_per_line: int = Form(1), line_pause_ms: int = Form(0),
+              sentence_pause_ms: int = Form(0), stanza_pause_ms: int = Form(0),
+              tail_fade_ms: int = Form(12), target_rms_db: float = Form(-18.0),
+              peak_db: float = Form(-1.0), reverb_wet: float = Form(0.0),
+              reverb_pre_delay_ms: int = Form(25),
+              reverb_decay_seconds: float = Form(1.1),
+              start_seconds: float = Form(0.0), end_seconds: Optional[float] = Form(None),
+              transcript: str = Form(""), source_label: str = Form(""),
+              rights_note: str = Form("")):
+    """Enroll and persist a 3-8 s reference clip as ``voice=name``.
 
     Plain ``def``: FastAPI runs it in a thread, so the blocking upload read,
     temp file and enrolment do not stall the event loop.
@@ -423,18 +678,105 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
     data = file.file.read(_MAX_CLIP_BYTES + 1)
     if len(data) > _MAX_CLIP_BYTES:
         raise HTTPException(413, "reference clip larger than 20 MB")
+    if len(transcript) > 4000 or len(source_label) > 300 or len(rights_note) > 1000:
+        raise HTTPException(400, "voice metadata exceeds its length limit")
     fd, path = tempfile.mkstemp(suffix=ext)
+    normalized_path = f"{path}.normalized.wav"
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        eng.tts.add_voice(name, path, denoise=denoise, description=description)
+        reference_metadata = _normalize_reference_audio(
+            path,
+            normalized_path,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        user_voices.save_user_voice(
+            eng.tts,
+            name,
+            normalized_path,
+            denoise=denoise,
+            description=description,
+            synthesis={
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+                "repetition_penalty": repetition_penalty,
+                "max_chars": max_chars,
+                "gain_db": gain_db,
+            },
+            delivery={
+                "mode": delivery_mode,
+                "candidates_per_line": candidates_per_line,
+                "line_pause_ms": line_pause_ms,
+                "sentence_pause_ms": sentence_pause_ms,
+                "stanza_pause_ms": stanza_pause_ms,
+                "tail_fade_ms": tail_fade_ms,
+                "target_rms_db": target_rms_db,
+                "peak_db": peak_db,
+                "reverb_wet": reverb_wet,
+                "reverb_pre_delay_ms": reverb_pre_delay_ms,
+                "reverb_decay_seconds": reverb_decay_seconds,
+            },
+            transcript=transcript,
+            source_label=source_label,
+            rights_note=rights_note,
+            reference_metadata=reference_metadata,
+        )
     except HTTPException:
         raise
     except Exception as e:   # noqa: BLE001
         raise HTTPException(400, f"could not enroll voice: {e}")
     finally:
         os.unlink(path)
-    return {"id": name, "name": name, "description": description}
+        if os.path.exists(normalized_path):
+            os.unlink(normalized_path)
+    voice = eng.tts._preset_voices[name]
+    revision = int(voice.get("revision") or 1)
+    return {
+        "id": name,
+        "name": name,
+        "description": description,
+        "source": "user",
+        "revision": revision,
+        "synthesis": user_voices.normalize_synthesis(voice.get("synthesis")),
+        "delivery": user_voices.normalize_delivery(voice.get("delivery")),
+        "profile": user_voices.profile_summary(name, revision),
+    }
+
+
+@app.get("/v1/voices/{name}/revisions", dependencies=[Depends(_auth)])
+def voice_revisions(name: str):
+    voice = engine().tts._preset_voices.get(name)
+    if voice is None or not voice.get(user_voices.USER_MARK):
+        raise HTTPException(404, "managed voice not found")
+    return {"object": "list", "data": user_voices.list_revisions(name)}
+
+
+@app.get("/v1/voices/{name}/reference", dependencies=[Depends(_auth)])
+def voice_reference(name: str, revision: Optional[int] = Query(None, ge=1)):
+    voice = engine().tts._preset_voices.get(name)
+    if voice is None or not voice.get(user_voices.USER_MARK):
+        raise HTTPException(404, "managed voice not found")
+    selected_revision = int(revision or voice.get("revision") or 1)
+    try:
+        path = user_voices.reference_audio_path(name, selected_revision)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(404, "managed voice reference not found") from exc
+    return FileResponse(
+        str(path),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.delete("/v1/voices/{name}", dependencies=[Depends(_auth)])
+def delete_voice(name: str):
+    try:
+        user_voices.delete_user_voice(engine().tts, name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": name, "deleted": True}
 
 
 @app.get("/health")

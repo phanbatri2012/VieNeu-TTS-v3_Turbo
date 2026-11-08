@@ -42,7 +42,21 @@ def home(tmp_path, monkeypatch):
 def test_turbo_roundtrip(home, tmp_path):
     tts = _FakeTurbo()
     wav = tmp_path / "ref.wav"; wav.write_bytes(b"x")
-    assert uv.save_user_voice(tts, " Anh Tuấn ", str(wav), description="trầm") == "Anh Tuấn"
+    assert uv.save_user_voice(
+        tts,
+        " Anh Tuấn ",
+        str(wav),
+        description="trầm",
+        delivery={
+            "mode": "poetry_recitation",
+            "candidates_per_line": 2,
+            "line_pause_ms": 900,
+            "sentence_pause_ms": 1200,
+            "stanza_pause_ms": 2200,
+            "target_rms_db": -15,
+            "reverb_wet": 0.08,
+        },
+    ) == "Anh Tuấn"
     assert uv.list_user_voices(tts) == ["Anh Tuấn"]
     assert (home / "user_voices_v3_turbo.json").is_file()
 
@@ -52,6 +66,12 @@ def test_turbo_roundtrip(home, tmp_path):
     assert e["description"] == "trầm" and e[uv.USER_MARK] and e["podcast"] is True
     assert e["speaker_emb"].dtype == np.float32 and e["speaker_emb"].shape == (192,)
     assert e["codes"].dtype == np.int64 and e["codes"].tolist() == [0, 1, 2, 3, 4, 5]
+    assert e["revision"] == 1
+    assert e["synthesis"]["temperature"] == 0.8
+    assert e["delivery"]["mode"] == "poetry_recitation"
+    assert e["delivery"]["stanza_pause_ms"] == 2200
+    assert uv.reference_audio_path("Anh Tuấn", 1).read_bytes() == b"x"
+    assert [item["revision"] for item in uv.list_revisions("Anh Tuấn")] == [1]
     assert "Minh Quân" in fresh._preset_voices           # built-ins untouched
 
     uv.delete_user_voice(fresh, "Anh Tuấn")
@@ -85,6 +105,12 @@ def test_validation(home, tmp_path):
     uv.save_user_voice(tts, "X", str(wav))
     uv.save_user_voice(tts, "X", str(wav), description="v2")   # re-save own voice = replace
     assert tts._preset_voices["X"]["description"] == "v2"
+    assert tts._preset_voices["X"]["revision"] == 2
+    assert [item["revision"] for item in uv.list_revisions("X")] == [1, 2]
+    with pytest.raises(ValueError):
+        uv.normalize_delivery({"mode": "unknown"})
+    with pytest.raises(ValueError):
+        uv.normalize_delivery({"mode": "poetry_recitation", "candidates_per_line": 4})
 
 
 def test_broken_file_is_ignored(home):
